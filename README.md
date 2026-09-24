@@ -28,7 +28,7 @@ cargo build --release
 export TMDB_API_KEY="YOUR_TMDB_API_KEY"
 ```
 
-也可以用 `mget config set tmdb.api_key YOUR_TMDB_API_KEY` 保存到用户配置。配置文件保存在操作系统的用户配置目录下，不需要放进媒体目录或仓库。`mget config list` 会隐藏 API key。
+也可以用 `mget config set tmdb.api_key YOUR_TMDB_API_KEY` 保存到用户配置；该命令会在终端回显传入值。配置文件保存在操作系统的用户配置目录下，不需要放进媒体目录或仓库。`mget config list` 会隐藏 API key。
 
 ## 搜索
 
@@ -47,8 +47,10 @@ mget search "Breaking Bad" --type tv --lang zh-CN
 `--output` 指向本地媒体文件。程序会在旁边生成同名 `.nfo`，并按 TMDB 返回的资源下载图片：
 
 ```sh
-mget fetch movie --id TMDB_ID --output "/media/movies/Movie (2024)/Movie (2024).mkv"
+mget fetch movie --id 123456 --output "/media/movies/Movie (2024)/Movie (2024).mkv"
 ```
+
+把示例里的数字 ID 换成搜索结果中的电影 ID。
 
 可能生成 `Movie (2024).nfo`、`Movie (2024)-poster.jpg`、`Movie (2024)-fanart.jpg` 和 `Movie (2024)-clearlogo.png`。如果不需要图片，可以加 `--no-images`；如果只要图片，可以加 `--images-only`。
 
@@ -57,9 +59,11 @@ mget fetch movie --id TMDB_ID --output "/media/movies/Movie (2024)/Movie (2024).
 `--output` 指向电视剧目录。程序会递归扫描目录中的媒体文件，并从文件名中识别 `S01E02` 形式的季和集编号：
 
 ```sh
-mget fetch tv --id TMDB_ID --output "/media/tv/Show Name"
-mget fetch tv --id TMDB_ID --output "/media/tv/Show Name" --season 1
+mget fetch tv --id 123456 --output "/media/tv/Show Name"
+mget fetch tv --id 123456 --output "/media/tv/Show Name" --season 1
 ```
+
+把示例里的数字 ID 换成搜索结果中的电视剧 ID。
 
 完整抓取会生成 `tvshow.nfo`、剧集 NFO、可用的剧集缩略图，以及剧集海报等图片。指定 `--season` 时只处理该季，不生成电视剧目录级别的文件。
 
@@ -105,7 +109,7 @@ mget config list
 
 ## 开发
 
-AI 助手的项目结构和修改约定见 [SKILL.md](SKILL.md)。
+AI 助手使用 `mget` 搜索资料并处理本地媒体文件的流程见 [SKILL.md](SKILL.md)。
 
 ```sh
 cargo build
