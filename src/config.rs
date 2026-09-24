@@ -1,240 +1,312 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+use clap::ValueEnum;
+use clap::builder::PossibleValue;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+use crate::fsutil;
+
+const API_KEY_ENV: &str = "TMDB_API_KEY";
+const NOT_SET: &str = "(not set)";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    #[serde(default)]
     pub tmdb: TmdbConfig,
-    #[serde(default)]
     pub defaults: DefaultsConfig,
-    #[serde(default)]
     pub network: NetworkConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TmdbConfig {
-    #[serde(default)]
     pub api_key: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DefaultsConfig {
-    #[serde(default = "default_language")]
     pub language: String,
-    #[serde(default = "default_fallback_language")]
     pub fallback_language: String,
-    #[serde(default = "default_image_size")]
     pub image_size: String,
-    #[serde(default)]
     pub image_language: Option<String>,
-    #[serde(default)]
     pub overwrite: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct NetworkConfig {
-    #[serde(default)]
-    pub proxy: Option<String>,
-    #[serde(default = "default_concurrent_downloads")]
-    pub concurrent_downloads: u32,
-    #[serde(default = "default_timeout")]
-    pub timeout: u64,
-}
-
-fn default_language() -> String {
-    "zh-CN".into()
-}
-fn default_fallback_language() -> String {
-    "en".into()
-}
-fn default_image_size() -> String {
-    "original".into()
-}
-fn default_concurrent_downloads() -> u32 {
-    4
-}
-fn default_timeout() -> u64 {
-    30
-}
-
-impl Default for TmdbConfig {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-        }
-    }
 }
 
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            language: default_language(),
-            fallback_language: default_fallback_language(),
-            image_size: default_image_size(),
+            language: "zh-CN".into(),
+            fallback_language: "en".into(),
+            image_size: "original".into(),
             image_language: None,
             overwrite: false,
         }
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConfig {
+    pub proxy: Option<String>,
+    pub concurrent_downloads: u32,
+    pub timeout: u64,
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             proxy: None,
-            concurrent_downloads: default_concurrent_downloads(),
-            timeout: default_timeout(),
+            concurrent_downloads: 4,
+            timeout: 30,
         }
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            tmdb: TmdbConfig::default(),
-            defaults: DefaultsConfig::default(),
-            network: NetworkConfig::default(),
+/// Every user-settable configuration key, addressed by its dotted name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKey {
+    TmdbApiKey,
+    Language,
+    FallbackLanguage,
+    ImageSize,
+    ImageLanguage,
+    Overwrite,
+    Proxy,
+    ConcurrentDownloads,
+    Timeout,
+}
+
+impl ConfigKey {
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfigKey::TmdbApiKey => "tmdb.api_key",
+            ConfigKey::Language => "defaults.language",
+            ConfigKey::FallbackLanguage => "defaults.fallback_language",
+            ConfigKey::ImageSize => "defaults.image_size",
+            ConfigKey::ImageLanguage => "defaults.image_language",
+            ConfigKey::Overwrite => "defaults.overwrite",
+            ConfigKey::Proxy => "network.proxy",
+            ConfigKey::ConcurrentDownloads => "network.concurrent_downloads",
+            ConfigKey::Timeout => "network.timeout",
         }
+    }
+
+    pub fn is_secret(self) -> bool {
+        self == ConfigKey::TmdbApiKey
+    }
+}
+
+impl ValueEnum for ConfigKey {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            ConfigKey::TmdbApiKey,
+            ConfigKey::Language,
+            ConfigKey::FallbackLanguage,
+            ConfigKey::ImageSize,
+            ConfigKey::ImageLanguage,
+            ConfigKey::Overwrite,
+            ConfigKey::Proxy,
+            ConfigKey::ConcurrentDownloads,
+            ConfigKey::Timeout,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(PossibleValue::new(self.name()))
     }
 }
 
 impl Config {
-    pub fn config_path() -> PathBuf {
+    pub fn path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("mget")
             .join("config.toml")
     }
 
-    pub fn load() -> crate::error::Result<Self> {
-        let path = Self::config_path();
-        let mut config = if path.exists() {
-            let content =
-                std::fs::read_to_string(&path).map_err(crate::error::Error::FileSystem)?;
-            toml::from_str(&content).map_err(|e| crate::error::Error::Config(e.to_string()))?
-        } else {
-            Config::default()
-        };
-
-        // Environment variable override
-        if let Ok(key) = std::env::var("TMDB_API_KEY") {
-            if !key.is_empty() {
-                config.tmdb.api_key = key;
-            }
+    /// Loads the config file (or defaults), then applies environment overrides.
+    pub fn load() -> Result<Self> {
+        let mut config = Self::load_file()?;
+        if let Ok(key) = std::env::var(API_KEY_ENV)
+            && !key.is_empty()
+        {
+            config.tmdb.api_key = key;
         }
-
         Ok(config)
     }
 
-    pub fn save(&self) -> crate::error::Result<()> {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Loads only the persisted file, without environment overrides, so that
+    /// `config set` never writes an env-provided key to disk.
+    pub fn load_file() -> Result<Self> {
+        match std::fs::read_to_string(Self::path()) {
+            Ok(content) => toml::from_str(&content).map_err(|e| Error::Config(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
         }
-        let content =
-            toml::to_string_pretty(self).map_err(|e| crate::error::Error::Config(e.to_string()))?;
-        std::fs::write(&path, content)?;
-        Ok(())
     }
 
-    pub fn set(&mut self, key: &str, value: &str) -> crate::error::Result<()> {
-        match key {
-            "tmdb.api_key" => self.tmdb.api_key = value.to_string(),
-            "defaults.language" => self.defaults.language = value.to_string(),
-            "defaults.fallback_language" => self.defaults.fallback_language = value.to_string(),
-            "defaults.image_size" => self.defaults.image_size = value.to_string(),
-            "defaults.image_language" => self.defaults.image_language = Some(value.to_string()),
-            "defaults.overwrite" => {
-                self.defaults.overwrite = value.parse().map_err(|_| {
-                    crate::error::Error::Config(format!("Invalid boolean: {}", value))
-                })?;
-            }
-            "network.proxy" => self.network.proxy = Some(value.to_string()),
-            "network.concurrent_downloads" => {
-                self.network.concurrent_downloads = value.parse().map_err(|_| {
-                    crate::error::Error::Config(format!("Invalid number: {}", value))
-                })?;
-            }
-            "network.timeout" => {
-                self.network.timeout = value.parse().map_err(|_| {
-                    crate::error::Error::Config(format!("Invalid number: {}", value))
-                })?;
-            }
-            _ => {
-                return Err(crate::error::Error::Config(format!(
-                    "Unknown config key: {}",
-                    key
-                )))
-            }
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        let content = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
+        fsutil::write_atomic(&path, content.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> crate::error::Result<String> {
+    pub fn get(&self, key: ConfigKey) -> String {
         match key {
-            "tmdb.api_key" => Ok(self.tmdb.api_key.clone()),
-            "defaults.language" => Ok(self.defaults.language.clone()),
-            "defaults.fallback_language" => Ok(self.defaults.fallback_language.clone()),
-            "defaults.image_size" => Ok(self.defaults.image_size.clone()),
-            "defaults.image_language" => {
-                Ok(self.defaults.image_language.clone().unwrap_or_default())
-            }
-            "defaults.overwrite" => Ok(self.defaults.overwrite.to_string()),
-            "network.proxy" => Ok(self.network.proxy.clone().unwrap_or_default()),
-            "network.concurrent_downloads" => Ok(self.network.concurrent_downloads.to_string()),
-            "network.timeout" => Ok(self.network.timeout.to_string()),
-            _ => Err(crate::error::Error::Config(format!(
-                "Unknown config key: {}",
-                key
-            ))),
+            ConfigKey::TmdbApiKey => self.tmdb.api_key.clone(),
+            ConfigKey::Language => self.defaults.language.clone(),
+            ConfigKey::FallbackLanguage => self.defaults.fallback_language.clone(),
+            ConfigKey::ImageSize => self.defaults.image_size.clone(),
+            ConfigKey::ImageLanguage => self.defaults.image_language.clone().unwrap_or_default(),
+            ConfigKey::Overwrite => self.defaults.overwrite.to_string(),
+            ConfigKey::Proxy => self.network.proxy.clone().unwrap_or_default(),
+            ConfigKey::ConcurrentDownloads => self.network.concurrent_downloads.to_string(),
+            ConfigKey::Timeout => self.network.timeout.to_string(),
         }
     }
 
-    pub fn list(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "tmdb.api_key".into(),
-                if self.tmdb.api_key.is_empty() {
-                    "(not set)".into()
-                } else {
-                    "********".into()
-                },
-            ),
-            ("defaults.language".into(), self.defaults.language.clone()),
-            (
-                "defaults.fallback_language".into(),
-                self.defaults.fallback_language.clone(),
-            ),
-            (
-                "defaults.image_size".into(),
-                self.defaults.image_size.clone(),
-            ),
-            (
-                "defaults.image_language".into(),
-                self.defaults.image_language.clone().unwrap_or_default(),
-            ),
-            (
-                "defaults.overwrite".into(),
-                self.defaults.overwrite.to_string(),
-            ),
-            (
-                "network.proxy".into(),
-                self.network.proxy.clone().unwrap_or("(not set)".into()),
-            ),
-            (
-                "network.concurrent_downloads".into(),
-                self.network.concurrent_downloads.to_string(),
-            ),
-            ("network.timeout".into(), self.network.timeout.to_string()),
-        ]
+    /// Value suitable for display: secrets are masked and empty values shown as "(not set)".
+    pub fn display(&self, key: ConfigKey) -> String {
+        let value = self.get(key);
+        match (value.is_empty(), key.is_secret()) {
+            (true, _) => NOT_SET.into(),
+            (false, true) => "********".into(),
+            (false, false) => value,
+        }
     }
 
-    pub fn api_key(&self) -> crate::error::Result<&str> {
+    /// Sets a key from its string form. An empty value clears optional keys.
+    pub fn set(&mut self, key: ConfigKey, value: &str) -> Result<()> {
+        let optional = |v: &str| (!v.is_empty()).then(|| v.to_string());
+        match key {
+            ConfigKey::TmdbApiKey => self.tmdb.api_key = value.trim().to_string(),
+            ConfigKey::Language => self.defaults.language = non_empty(key, value)?,
+            ConfigKey::FallbackLanguage => self.defaults.fallback_language = non_empty(key, value)?,
+            ConfigKey::ImageSize => self.defaults.image_size = non_empty(key, value)?,
+            ConfigKey::ImageLanguage => self.defaults.image_language = optional(value),
+            ConfigKey::Overwrite => self.defaults.overwrite = parse(key, value)?,
+            ConfigKey::Proxy => self.network.proxy = optional(value),
+            ConfigKey::ConcurrentDownloads => {
+                self.network.concurrent_downloads = positive(key, parse(key, value)?)?;
+            }
+            ConfigKey::Timeout => self.network.timeout = positive(key, parse(key, value)?)?,
+        }
+        Ok(())
+    }
+
+    pub fn api_key(&self) -> Result<&str> {
         if self.tmdb.api_key.is_empty() {
-            Err(crate::error::Error::Config(
-                "TMDB API key not set. Use 'mget config set tmdb.api_key YOUR_KEY' or set TMDB_API_KEY env var.".into(),
-            ))
-        } else {
-            Ok(&self.tmdb.api_key)
+            return Err(Error::Config(format!(
+                "TMDB API key not set. Use 'mget config set tmdb.api_key YOUR_KEY' or set {API_KEY_ENV} env var."
+            )));
         }
+        Ok(&self.tmdb.api_key)
+    }
+
+    /// Preferred image languages, most preferred first.
+    pub fn image_languages(&self) -> Vec<String> {
+        self.defaults
+            .image_language
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    }
+}
+
+fn non_empty(key: ConfigKey, value: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(Error::Config(format!("{} cannot be empty", key.name())));
+    }
+    Ok(value.trim().to_string())
+}
+
+fn parse<T: std::str::FromStr>(key: ConfigKey, value: &str) -> Result<T> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| Error::Config(format!("Invalid value for {}: {value}", key.name())))
+}
+
+fn positive<T: PartialOrd + Default>(key: ConfigKey, value: T) -> Result<T> {
+    if value <= T::default() {
+        return Err(Error::Config(format!(
+            "{} must be greater than 0",
+            key.name()
+        )));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_set_round_trip() {
+        let mut config = Config::default();
+        for key in ConfigKey::value_variants() {
+            let sample = match key {
+                ConfigKey::Overwrite => "true",
+                ConfigKey::ConcurrentDownloads | ConfigKey::Timeout => "7",
+                _ => "value",
+            };
+            config.set(*key, sample).unwrap();
+            assert_eq!(config.get(*key), sample, "{}", key.name());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        let mut config = Config::default();
+        assert!(config.set(ConfigKey::ConcurrentDownloads, "0").is_err());
+        assert!(config.set(ConfigKey::Timeout, "abc").is_err());
+        assert!(config.set(ConfigKey::Overwrite, "yes").is_err());
+        assert!(config.set(ConfigKey::Language, " ").is_err());
+    }
+
+    #[test]
+    fn empty_value_clears_optional_keys() {
+        let mut config = Config::default();
+        config.set(ConfigKey::Proxy, "http://p:1").unwrap();
+        config.set(ConfigKey::Proxy, "").unwrap();
+        assert_eq!(config.network.proxy, None);
+        assert_eq!(config.display(ConfigKey::Proxy), NOT_SET);
+    }
+
+    #[test]
+    fn masks_secrets() {
+        let mut config = Config::default();
+        assert_eq!(config.display(ConfigKey::TmdbApiKey), NOT_SET);
+        config.set(ConfigKey::TmdbApiKey, "abc").unwrap();
+        assert_eq!(config.display(ConfigKey::TmdbApiKey), "********");
+    }
+
+    #[test]
+    fn parses_image_languages() {
+        let mut config = Config::default();
+        config
+            .set(ConfigKey::ImageLanguage, " zh, en ,,ja")
+            .unwrap();
+        assert_eq!(config.image_languages(), ["zh", "en", "ja"]);
+    }
+
+    #[test]
+    fn partial_file_uses_defaults() {
+        let config: Config = toml::from_str("[defaults]\nlanguage = \"en\"\n").unwrap();
+        assert_eq!(config.defaults.language, "en");
+        assert_eq!(config.defaults.image_size, "original");
+        assert_eq!(config.network.concurrent_downloads, 4);
     }
 }

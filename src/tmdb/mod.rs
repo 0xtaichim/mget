@@ -1,193 +1,273 @@
+pub mod images;
 pub mod types;
+
+use std::collections::HashMap;
+
+use clap::ValueEnum;
+use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use reqwest::Client;
-use std::time::Duration;
+use crate::http;
+use types::{Collection, MovieDetail, SearchResults, SeasonDetail, TvShowDetail};
+
+const API_BASE: &str = "https://api.themoviedb.org/3";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MediaType {
+    Movie,
+    Tv,
+}
+
+enum Auth {
+    /// v3 API key, sent as a query parameter.
+    ApiKey(String),
+    /// v4 read access token (a JWT), sent as a bearer header.
+    Bearer(String),
+}
 
 pub struct TmdbClient {
-    client: Client,
-    api_key: String,
-    language: String,
+    http: Client,
+    auth: Auth,
     fallback_language: String,
+    image_languages: Vec<String>,
 }
 
 impl TmdbClient {
-    pub fn new(config: &Config) -> Result<Self> {
-        let api_key = config.api_key()?.to_string();
-        let mut builder = Client::builder()
-            .timeout(Duration::from_secs(config.network.timeout));
-        if let Some(proxy) = &config.network.proxy {
-            builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(Error::Network)?);
-        }
-        let client = builder.build().map_err(Error::Network)?;
+    pub fn new(http: Client, config: &Config) -> Result<Self> {
+        let key = config.api_key()?.to_string();
+        let auth = if key.starts_with("eyJ") {
+            Auth::Bearer(key)
+        } else {
+            Auth::ApiKey(key)
+        };
         Ok(Self {
-            client,
-            api_key,
-            language: config.defaults.language.clone(),
+            http,
+            auth,
             fallback_language: config.defaults.fallback_language.clone(),
+            image_languages: config.image_languages(),
         })
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let mut retries = 0;
-        loop {
-            let resp = self.client.get(url).send().await;
-            match resp {
-                Ok(r) => {
-                    if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        if retries < 3 {
-                            retries += 1;
-                            let wait = Duration::from_millis(500 * retries as u64);
-                            tokio::time::sleep(wait).await;
-                            continue;
-                        }
-                        return Err(Error::Api("Rate limited by TMDB".into()));
-                    }
-                    if r.status() == reqwest::StatusCode::NOT_FOUND {
-                        return Err(Error::NotFound("Resource not found on TMDB".into()));
-                    }
-                    if !r.status().is_success() {
-                        let status = r.status();
-                        let body = r.text().await.unwrap_or_default();
-                        return Err(Error::Api(format!("TMDB API error {}: {}", status, body)));
-                    }
-                    return r.json::<T>().await.map_err(Error::Network);
-                }
-                Err(e) => {
-                    if retries < 3 {
-                        retries += 1;
-                        let wait = Duration::from_secs(retries as u64);
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
-                    return Err(Error::Network(e));
-                }
-            }
+    async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
+        let mut req = self.http.get(format!("{API_BASE}{path}")).query(query);
+        req = match &self.auth {
+            Auth::ApiKey(key) => req.query(&[("api_key", key)]),
+            Auth::Bearer(token) => req.bearer_auth(token),
+        };
+
+        let resp = http::send(req).await?;
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(Error::NotFound(format!(
+                "Resource not found on TMDB: {path}"
+            )));
         }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Network(e.without_url()))?;
+        if !status.is_success() {
+            return Err(Error::Api(format!(
+                "TMDB API error {status}: {}",
+                error_message(&body)
+            )));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| Error::Api(format!("Unexpected TMDB response for {path}: {e}")))
     }
 
     pub async fn search(
         &self,
         query: &str,
-        media_type: &str,
+        media_type: MediaType,
         year: Option<u32>,
-        language: Option<&str>,
-    ) -> Result<types::SearchResults> {
-        let lang = language.unwrap_or(&self.language);
-        let endpoint = match media_type {
-            "movie" => "movie",
-            "tv" => "tv",
-            _ => return Err(Error::Parse(format!("Unknown media type: {}", media_type))),
+        language: &str,
+    ) -> Result<SearchResults> {
+        let (path, year_param) = match media_type {
+            MediaType::Movie => ("/search/movie", "year"),
+            MediaType::Tv => ("/search/tv", "first_air_date_year"),
         };
-        let mut url = url::Url::parse(&format!(
-            "https://api.themoviedb.org/3/search/{}",
-            endpoint
-        ))
-        .map_err(|e| Error::Parse(e.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("api_key", &self.api_key)
-            .append_pair("query", query)
-            .append_pair("language", lang);
-        if let Some(y) = year {
-            match media_type {
-                "movie" => {
-                    url.query_pairs_mut()
-                        .append_pair("year", &y.to_string());
-                }
-                "tv" => {
-                    url.query_pairs_mut()
-                        .append_pair("first_air_date_year", &y.to_string());
-                }
-                _ => {}
-            }
+        let year = year.map(|y| y.to_string());
+        let mut params = vec![("query", query), ("language", language)];
+        if let Some(y) = &year {
+            params.push((year_param, y));
         }
-        self.get_json(url.as_str()).await
+        self.get(path, &params).await
     }
 
-    pub async fn get_movie(
-        &self,
-        id: u64,
-        language: Option<&str>,
-    ) -> Result<types::MovieDetail> {
-        let lang = language.unwrap_or(&self.language);
-        let url = format!(
-            "https://api.themoviedb.org/3/movie/{}?api_key={}&language={}&append_to_response=credits,videos,images,release_dates,keywords&include_image_language={},null",
-            id, self.api_key, lang, lang.split('-').next().unwrap_or("en"),
-        );
-        self.get_json(&url).await
-    }
+    /// Full movie details. Overview and tagline fall back to the configured
+    /// fallback language when the requested language has no overview.
+    pub async fn movie(&self, id: u64, language: &str) -> Result<MovieDetail> {
+        let path = format!("/movie/{id}");
+        let (images, videos) = (self.image_filter(language), video_filter(language));
+        let mut movie: MovieDetail = self
+            .get(
+                &path,
+                &[
+                    ("language", language),
+                    (
+                        "append_to_response",
+                        "credits,videos,images,release_dates,keywords",
+                    ),
+                    ("include_image_language", &images),
+                    ("include_video_language", &videos),
+                ],
+            )
+            .await?;
 
-    pub async fn get_movie_fallback(
-        &self,
-        id: u64,
-        language: Option<&str>,
-    ) -> Result<types::MovieDetail> {
-        let lang = language.unwrap_or(&self.language);
-        let mut movie = self.get_movie(id, Some(lang)).await?;
-
-        if movie.overview.as_deref().unwrap_or("").is_empty() && self.fallback_language != lang {
-            if let Ok(fallback) = self.get_movie(id, Some(&self.fallback_language)).await {
-                if movie.overview.as_deref().unwrap_or("").is_empty() {
-                    movie.overview = fallback.overview;
-                }
-                if movie.tagline.as_deref().unwrap_or("").is_empty() {
-                    movie.tagline = fallback.tagline;
-                }
-            }
+        if let Some(fallback) = self.fallback_for(language)
+            && is_blank(movie.overview.as_deref())
+            && let Ok(alt) = self
+                .get::<MovieDetail>(&path, &[("language", fallback)])
+                .await
+        {
+            fill_blank(&mut movie.overview, alt.overview);
+            fill_blank(&mut movie.tagline, alt.tagline);
         }
         Ok(movie)
     }
 
-    pub async fn get_collection(&self, id: u64) -> Result<types::Collection> {
-        let url = format!(
-            "https://api.themoviedb.org/3/collection/{}?api_key={}&language={}",
-            id, self.api_key, self.language,
-        );
-        self.get_json(&url).await
+    pub async fn collection(&self, id: u64, language: &str) -> Result<Collection> {
+        self.get(&format!("/collection/{id}"), &[("language", language)])
+            .await
     }
 
-    pub async fn get_tv_show(
-        &self,
-        id: u64,
-        language: Option<&str>,
-    ) -> Result<types::TvShowDetail> {
-        let lang = language.unwrap_or(&self.language);
-        let url = format!(
-            "https://api.themoviedb.org/3/tv/{}?api_key={}&language={}&append_to_response=credits,videos,images,content_ratings,external_ids,keywords&include_image_language={},null",
-            id, self.api_key, lang, lang.split('-').next().unwrap_or("en"),
-        );
-        self.get_json(&url).await
-    }
+    /// Full show details, with overview falling back like [`Self::movie`].
+    pub async fn tv_show(&self, id: u64, language: &str) -> Result<TvShowDetail> {
+        let path = format!("/tv/{id}");
+        let (images, videos) = (self.image_filter(language), video_filter(language));
+        let mut show: TvShowDetail = self
+            .get(
+                &path,
+                &[
+                    ("language", language),
+                    (
+                        "append_to_response",
+                        "credits,videos,images,content_ratings,external_ids,keywords",
+                    ),
+                    ("include_image_language", &images),
+                    ("include_video_language", &videos),
+                ],
+            )
+            .await?;
 
-    pub async fn get_tv_show_fallback(
-        &self,
-        id: u64,
-        language: Option<&str>,
-    ) -> Result<types::TvShowDetail> {
-        let lang = language.unwrap_or(&self.language);
-        let mut show = self.get_tv_show(id, Some(lang)).await?;
-        if show.overview.as_deref().unwrap_or("").is_empty() && self.fallback_language != lang {
-            if let Ok(fallback) = self.get_tv_show(id, Some(&self.fallback_language)).await {
-                if show.overview.as_deref().unwrap_or("").is_empty() {
-                    show.overview = fallback.overview;
-                }
-            }
+        if let Some(fallback) = self.fallback_for(language)
+            && is_blank(show.overview.as_deref())
+            && let Ok(alt) = self
+                .get::<TvShowDetail>(&path, &[("language", fallback)])
+                .await
+        {
+            fill_blank(&mut show.overview, alt.overview);
         }
         Ok(show)
     }
 
-    pub async fn get_tv_season(
+    pub async fn season(&self, tv_id: u64, season: u32, language: &str) -> Result<SeasonDetail> {
+        let images = self.image_filter(language);
+        self.get(
+            &format!("/tv/{tv_id}/season/{season}"),
+            &[
+                ("language", language),
+                ("append_to_response", "images"),
+                ("include_image_language", &images),
+            ],
+        )
+        .await
+    }
+
+    /// Episode number → episode title for one season, without any appended data.
+    pub async fn episode_titles(
         &self,
         tv_id: u64,
-        season_number: u32,
-        language: Option<&str>,
-    ) -> Result<types::SeasonDetail> {
-        let lang = language.unwrap_or(&self.language);
-        let url = format!(
-            "https://api.themoviedb.org/3/tv/{}/season/{}?api_key={}&language={}&append_to_response=credits,videos,images&include_image_language={},null",
-            tv_id, season_number, self.api_key, lang, lang.split('-').next().unwrap_or("en"),
-        );
-        self.get_json(&url).await
+        season: u32,
+        language: &str,
+    ) -> Result<HashMap<u32, String>> {
+        let detail: SeasonDetail = self
+            .get(
+                &format!("/tv/{tv_id}/season/{season}"),
+                &[("language", language)],
+            )
+            .await?;
+        Ok(detail
+            .episodes
+            .into_iter()
+            .filter_map(|ep| ep.name.map(|name| (ep.episode_number, name)))
+            .collect())
+    }
+
+    fn fallback_for(&self, language: &str) -> Option<&str> {
+        let fallback = self.fallback_language.as_str();
+        (!fallback.is_empty() && fallback != language).then_some(fallback)
+    }
+
+    /// `include_image_language` value: preferred image languages, the request
+    /// language, then language-neutral images.
+    fn image_filter(&self, language: &str) -> String {
+        let mut langs: Vec<&str> = self.image_languages.iter().map(String::as_str).collect();
+        langs.extend([primary_subtag(language), "null"]);
+        dedup_join(langs)
+    }
+}
+
+pub fn primary_subtag(language: &str) -> &str {
+    language.split('-').next().unwrap_or(language)
+}
+
+/// `include_video_language` value: trailers are often only published in English.
+fn video_filter(language: &str) -> String {
+    dedup_join(vec![primary_subtag(language), "en", "null"])
+}
+
+fn dedup_join(items: Vec<&str>) -> String {
+    let mut seen = Vec::with_capacity(items.len());
+    for item in items {
+        if !seen.contains(&item) {
+            seen.push(item);
+        }
+    }
+    seen.join(",")
+}
+
+fn is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|s| s.trim().is_empty())
+}
+
+fn fill_blank(target: &mut Option<String>, alt: Option<String>) {
+    if is_blank(target.as_deref()) && !is_blank(alt.as_deref()) {
+        *target = alt;
+    }
+}
+
+fn error_message(body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct TmdbError {
+        status_message: String,
+    }
+    serde_json::from_slice::<TmdbError>(body).map_or_else(
+        |_| String::from_utf8_lossy(body).into_owned(),
+        |e| e.status_message,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_language_filters() {
+        assert_eq!(primary_subtag("zh-CN"), "zh");
+        assert_eq!(primary_subtag("en"), "en");
+        assert_eq!(video_filter("zh-CN"), "zh,en,null");
+        assert_eq!(video_filter("en-US"), "en,null");
+        assert_eq!(dedup_join(vec!["en", "zh", "en", "null"]), "en,zh,null");
+    }
+
+    #[test]
+    fn extracts_tmdb_error_message() {
+        let body = br#"{"status_code":7,"status_message":"Invalid API key","success":false}"#;
+        assert_eq!(error_message(body), "Invalid API key");
+        assert_eq!(error_message(b"oops"), "oops");
     }
 }

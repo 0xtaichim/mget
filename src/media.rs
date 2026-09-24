@@ -1,133 +1,188 @@
+//! Local media discovery and Emby/Kodi file naming conventions.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
 use crate::error::{Error, Result};
 
-#[derive(Debug, Clone)]
-pub struct EpisodeFile {
-    pub path: PathBuf,
-    pub season: u32,
-    pub episode: u32,
-}
-
 const MEDIA_EXTENSIONS: &[&str] = &[
-    "mkv", "mp4", "avi", "wmv", "flv", "mov", "ts", "m2ts",
-    "webm", "rmvb", "rm", "mpg", "mpeg", "iso", "strm",
+    "mkv", "mp4", "avi", "wmv", "flv", "mov", "ts", "m2ts", "webm", "rmvb", "rm", "mpg", "mpeg",
+    "iso", "strm",
 ];
+
+/// Directories created by NAS software that never contain real episodes.
+const IGNORED_DIRS: &[&str] = &["@eaDir", "#recycle", "$RECYCLE.BIN", "lost+found"];
+
+const MAX_SCAN_DEPTH: usize = 8;
+
+/// Local episode files keyed by `(season, episode)`. Several files may map to
+/// the same episode (e.g. different editions or resolutions).
+pub type EpisodeIndex = BTreeMap<(u32, u32), Vec<PathBuf>>;
 
 pub fn is_media_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| MEDIA_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_some_and(|e| MEDIA_EXTENSIONS.iter().any(|m| m.eq_ignore_ascii_case(e)))
 }
 
-pub fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Parse season and episode numbers from a filename.
-/// Supports patterns like S01E01, S1E1, s01e01, etc.
-pub fn parse_season_episode(filename: &str) -> Option<(u32, u32)> {
-    // Try S01E01 pattern (case insensitive)
-    let upper = filename.to_uppercase();
-
-    // Look for SxxExx pattern
-    let mut i = 0;
-    let chars: Vec<char> = upper.chars().collect();
-    while i < chars.len() {
-        if chars[i] == 'S' {
-            let s_start = i + 1;
-            let mut s_end = s_start;
-            while s_end < chars.len() && chars[s_end].is_ascii_digit() {
-                s_end += 1;
-            }
-            if s_end > s_start && s_end < chars.len() && chars[s_end] == 'E' {
-                let e_start = s_end + 1;
-                let mut e_end = e_start;
-                while e_end < chars.len() && chars[e_end].is_ascii_digit() {
-                    e_end += 1;
-                }
-                if e_end > e_start {
-                    let season: String = chars[s_start..s_end].iter().collect();
-                    let episode: String = chars[e_start..e_end].iter().collect();
-                    if let (Ok(s), Ok(e)) = (season.parse::<u32>(), episode.parse::<u32>()) {
-                        return Some((s, e));
-                    }
-                }
-            }
+/// Parses the first `S<season>E<episode>` marker (case-insensitive) in a name.
+pub fn parse_season_episode(name: &str) -> Option<(u32, u32)> {
+    let bytes = name.as_bytes();
+    (0..bytes.len()).find_map(|i| {
+        if !bytes[i].eq_ignore_ascii_case(&b'S') {
+            return None;
         }
-        i += 1;
-    }
-    None
+        let (season, rest) = take_number(&bytes[i + 1..])?;
+        let rest = rest
+            .strip_prefix(b"E")
+            .or_else(|| rest.strip_prefix(b"e"))?;
+        let (episode, _) = take_number(rest)?;
+        Some((season, episode))
+    })
 }
 
-/// Scan a TV show directory for media files, extracting season/episode info.
-/// Looks in subdirectories (Season X, S01, etc.) and the root directory.
-pub fn scan_tv_directory(dir: &Path) -> Result<Vec<EpisodeFile>> {
-    let mut episodes = Vec::new();
+fn take_number(bytes: &[u8]) -> Option<(u32, &[u8])> {
+    let len = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    let digits = std::str::from_utf8(&bytes[..len]).ok()?;
+    Some((digits.parse().ok()?, &bytes[len..]))
+}
 
+/// Recursively scans a show directory for media files named with `SxxEyy`.
+pub fn scan_tv_directory(dir: &Path) -> Result<EpisodeIndex> {
     if !dir.is_dir() {
-        return Err(Error::FileSystem(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        return Err(Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
             format!("Directory not found: {}", dir.display()),
         )));
     }
-
-    // Scan the root and all subdirectories
-    scan_dir_recursive(dir, &mut episodes)?;
-
-    episodes.sort_by(|a, b| {
-        a.season.cmp(&b.season).then(a.episode.cmp(&b.episode))
-    });
-
-    Ok(episodes)
+    let mut index = EpisodeIndex::new();
+    scan_dir(dir, 0, &mut index)?;
+    for paths in index.values_mut() {
+        paths.sort();
+    }
+    Ok(index)
 }
 
-fn scan_dir_recursive(dir: &Path, episodes: &mut Vec<EpisodeFile>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
+fn scan_dir(dir: &Path, depth: usize, index: &mut EpisodeIndex) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skips dotfiles, including macOS "._" AppleDouble companions of real videos.
+        if name.starts_with('.') {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            scan_dir_recursive(&path, episodes)?;
-        } else if is_media_file(&path) {
-            let stem = file_stem(&path);
-            if let Some((season, episode)) = parse_season_episode(&stem) {
-                episodes.push(EpisodeFile {
-                    path,
-                    season,
-                    episode,
-                });
+        // `fs::metadata` follows symlinks; the depth cap guards against cycles.
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if depth < MAX_SCAN_DEPTH && !IGNORED_DIRS.contains(&name.as_ref()) {
+                scan_dir(&path, depth + 1, index)?;
             }
+        } else if is_media_file(&path)
+            && let Some(key) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(parse_season_episode)
+        {
+            index.entry(key).or_default().push(path);
         }
     }
     Ok(())
 }
 
-/// Get the NFO path for a media file (same name, .nfo extension).
-pub fn nfo_path(media_path: &Path) -> PathBuf {
-    media_path.with_extension("nfo")
+/// `movie.mkv` → `movie.nfo`
+pub fn nfo_path(media: &Path) -> PathBuf {
+    media.with_extension("nfo")
 }
 
-/// Get the image path for a movie file with a suffix like "-poster", "-fanart", etc.
-pub fn movie_image_path(media_path: &Path, suffix: &str, ext: &str) -> PathBuf {
-    let stem = file_stem(media_path);
-    let parent = media_path.parent().unwrap_or(Path::new("."));
-    parent.join(format!("{}{}.{}", stem, suffix, ext))
+/// `movie.mkv` + `-poster`, `jpg` → `movie-poster.jpg`
+pub fn sidecar_path(media: &Path, suffix: &str, ext: &str) -> PathBuf {
+    let stem = media.file_stem().unwrap_or_default().to_string_lossy();
+    media.with_file_name(format!("{stem}{suffix}.{ext}"))
 }
 
-/// Get the episode thumbnail path (same name, .jpg extension for episodes).
-pub fn episode_image_path(media_path: &Path) -> PathBuf {
-    media_path.with_extension("jpg")
+/// `episode.mkv` → `episode.jpg`
+pub fn episode_thumb_path(media: &Path) -> PathBuf {
+    media.with_extension("jpg")
 }
 
-/// Get show-level image path in the root directory.
-pub fn show_image_path(show_dir: &Path, name: &str) -> PathBuf {
-    show_dir.join(name)
+/// Season poster in the show root: `season01-poster.jpg`, or
+/// `season-specials-poster.jpg` for season 0.
+pub fn season_poster_path(show_dir: &Path, season: u32) -> PathBuf {
+    if season == 0 {
+        show_dir.join("season-specials-poster.jpg")
+    } else {
+        show_dir.join(format!("season{season:02}-poster.jpg"))
+    }
 }
 
-/// Get season poster path like "season01-poster.jpg" in the show root directory.
-pub fn season_image_path(show_dir: &Path, season_number: u32, suffix: &str) -> PathBuf {
-    show_dir.join(format!("season{:02}{}.jpg", season_number, suffix))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_season_episode_markers() {
+        assert_eq!(parse_season_episode("Show.S01E02.1080p"), Some((1, 2)));
+        assert_eq!(parse_season_episode("show s1e10"), Some((1, 10)));
+        assert_eq!(parse_season_episode("剧名 S02E03 中字"), Some((2, 3)));
+        assert_eq!(parse_season_episode("Sherlock S03E01"), Some((3, 1)));
+        assert_eq!(parse_season_episode("Series Episode 1"), None);
+        assert_eq!(parse_season_episode("S01"), None);
+        assert_eq!(parse_season_episode("SE01"), None);
+    }
+
+    #[test]
+    fn detects_media_files() {
+        assert!(is_media_file(Path::new("a/b.MKV")));
+        assert!(is_media_file(Path::new("b.strm")));
+        assert!(!is_media_file(Path::new("b.nfo")));
+        assert!(!is_media_file(Path::new("mkv")));
+    }
+
+    #[test]
+    fn builds_sidecar_paths() {
+        let media = Path::new("/m/Movie (2024).mkv");
+        assert_eq!(nfo_path(media), Path::new("/m/Movie (2024).nfo"));
+        assert_eq!(
+            sidecar_path(media, "-clearlogo", "png"),
+            Path::new("/m/Movie (2024)-clearlogo.png")
+        );
+        assert_eq!(
+            season_poster_path(Path::new("/tv"), 3),
+            Path::new("/tv/season03-poster.jpg")
+        );
+        assert_eq!(
+            season_poster_path(Path::new("/tv"), 0),
+            Path::new("/tv/season-specials-poster.jpg")
+        );
+    }
+
+    #[test]
+    fn scan_skips_hidden_and_system_entries() {
+        let root = std::env::temp_dir().join(format!("mget-scan-{}", std::process::id()));
+        let season = root.join("Season 1");
+        fs::create_dir_all(&season).unwrap();
+        fs::create_dir_all(root.join("@eaDir")).unwrap();
+        for f in [
+            "Season 1/Show S01E01.mkv",
+            "Season 1/._Show S01E01.mkv",
+            "Season 1/Show S01E01.2160p.mkv",
+            "Season 1/Show S01E02.nfo",
+            "@eaDir/Show S01E03.mkv",
+            "Show S00E01.strm",
+        ] {
+            fs::write(root.join(f), b"").unwrap();
+        }
+
+        let index = scan_tv_directory(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(index.keys().copied().collect::<Vec<_>>(), [(0, 1), (1, 1)]);
+        assert_eq!(index[&(1, 1)].len(), 2);
+    }
 }

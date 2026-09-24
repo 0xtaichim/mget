@@ -1,15 +1,25 @@
-use serde::{Deserialize, Serialize};
+//! TMDB response models, limited to the fields mget consumes.
 
-// Search results
-#[derive(Debug, Deserialize, Serialize)]
+use serde::{Deserialize, Deserializer};
+
+/// Treats an explicit `null` like a missing field.
+fn nullable<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(d).map(Option::unwrap_or_default)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SearchResults {
-    pub page: u32,
     pub total_results: u32,
-    pub total_pages: u32,
+    #[serde(default, deserialize_with = "nullable")]
     pub results: Vec<SearchResult>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+/// A movie or TV search hit; TV field names are aliased onto the movie ones.
+#[derive(Debug, Deserialize)]
 pub struct SearchResult {
     pub id: u64,
     #[serde(alias = "name")]
@@ -20,18 +30,10 @@ pub struct SearchResult {
     pub release_date: Option<String>,
     pub overview: Option<String>,
     pub poster_path: Option<String>,
-    pub backdrop_path: Option<String>,
     pub vote_average: Option<f64>,
-    pub vote_count: Option<u64>,
-    pub popularity: Option<f64>,
-    #[serde(default)]
-    pub genre_ids: Vec<u32>,
-    pub media_type: Option<String>,
-    pub original_language: Option<String>,
 }
 
-// Movie detail
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct MovieDetail {
     pub id: u64,
     pub title: Option<String>,
@@ -40,93 +42,61 @@ pub struct MovieDetail {
     pub overview: Option<String>,
     pub release_date: Option<String>,
     pub runtime: Option<u32>,
-    pub budget: Option<u64>,
-    pub revenue: Option<u64>,
-    pub status: Option<String>,
-    pub original_language: Option<String>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
     pub vote_average: Option<f64>,
     pub vote_count: Option<u64>,
     pub imdb_id: Option<String>,
-    #[serde(default)]
-    pub genres: Vec<Genre>,
-    #[serde(default)]
-    pub production_companies: Vec<ProductionCompany>,
-    #[serde(default)]
-    pub production_countries: Vec<ProductionCountry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
+    pub genres: Vec<Named>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub production_companies: Vec<Named>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub production_countries: Vec<Named>,
+    #[serde(default, deserialize_with = "nullable")]
     pub spoken_languages: Vec<SpokenLanguage>,
     pub belongs_to_collection: Option<CollectionRef>,
     pub credits: Option<Credits>,
     pub videos: Option<VideoResults>,
     pub images: Option<ImageResults>,
     pub release_dates: Option<ReleaseDateResults>,
-    pub keywords: Option<MovieKeywordResults>,
+    pub keywords: Option<MovieKeywords>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Genre {
-    pub id: u32,
+/// Any TMDB object where only the display name matters (genres, studios, countries).
+#[derive(Debug, Deserialize)]
+pub struct Named {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ProductionCompany {
-    pub id: u64,
-    pub name: String,
-    pub logo_path: Option<String>,
-    pub origin_country: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ProductionCountry {
-    pub iso_3166_1: String,
-    pub name: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct SpokenLanguage {
-    pub iso_639_1: String,
     pub name: String,
     pub english_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct CollectionRef {
     pub id: u64,
     pub name: String,
-    pub poster_path: Option<String>,
-    pub backdrop_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct Collection {
     pub id: u64,
     pub name: String,
     pub overview: Option<String>,
-    pub poster_path: Option<String>,
-    pub backdrop_path: Option<String>,
-    #[serde(default)]
-    pub parts: Vec<CollectionPart>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CollectionPart {
-    pub id: u64,
-    pub title: Option<String>,
-    pub release_date: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Credits {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub cast: Vec<CastMember>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub crew: Vec<CrewMember>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct CastMember {
     pub id: u64,
     pub name: String,
@@ -135,197 +105,143 @@ pub struct CastMember {
     pub profile_path: Option<String>,
 }
 
-impl CastMember {
-    pub fn profile(&self) -> String {
-        format!("https://www.themoviedb.org/person/{}", self.id)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct CrewMember {
     pub id: u64,
     pub name: String,
     pub job: String,
-    pub department: Option<String>,
-    pub profile_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct VideoResults {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub results: Vec<Video>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct Video {
     pub key: String,
-    pub name: String,
     pub site: String,
     #[serde(rename = "type")]
-    pub video_type: String,
-    pub official: Option<bool>,
-    pub iso_639_1: Option<String>,
+    pub kind: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ImageResults {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub posters: Vec<Image>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub backdrops: Vec<Image>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub logos: Vec<Image>,
-    #[serde(default)]
-    pub stills: Vec<Image>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct Image {
     pub file_path: String,
     pub width: Option<u32>,
-    pub height: Option<u32>,
     pub vote_average: Option<f64>,
-    pub vote_count: Option<u32>,
     pub iso_639_1: Option<String>,
-    pub aspect_ratio: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct ReleaseDateResults {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub results: Vec<ReleaseDateCountry>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct ReleaseDateCountry {
     pub iso_3166_1: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub release_dates: Vec<ReleaseDate>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct ReleaseDate {
     pub certification: Option<String>,
-    pub release_date: Option<String>,
-    #[serde(rename = "type")]
-    pub release_type: Option<u32>,
 }
 
-// TV Show types
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
+pub struct MovieKeywords {
+    #[serde(default, deserialize_with = "nullable")]
+    pub keywords: Vec<Named>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TvShowDetail {
     pub id: u64,
     pub name: Option<String>,
     pub original_name: Option<String>,
     pub overview: Option<String>,
     pub first_air_date: Option<String>,
-    pub last_air_date: Option<String>,
     pub status: Option<String>,
-    pub tagline: Option<String>,
     pub original_language: Option<String>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
     pub vote_average: Option<f64>,
     pub vote_count: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub episode_run_time: Vec<u32>,
-    #[serde(default)]
-    pub genres: Vec<Genre>,
-    #[serde(default)]
-    pub production_companies: Vec<ProductionCompany>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
+    pub genres: Vec<Named>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub production_companies: Vec<Named>,
+    #[serde(default, deserialize_with = "nullable")]
     pub origin_country: Vec<String>,
-    #[serde(default)]
-    pub languages: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub seasons: Vec<SeasonSummary>,
-    #[serde(default)]
-    pub networks: Vec<ProductionCompany>,
-    #[serde(default)]
-    pub created_by: Vec<CreatedBy>,
-    pub number_of_seasons: Option<u32>,
-    pub number_of_episodes: Option<u32>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub networks: Vec<Named>,
     pub credits: Option<Credits>,
     pub videos: Option<VideoResults>,
     pub images: Option<ImageResults>,
     pub content_ratings: Option<ContentRatings>,
     pub external_ids: Option<ExternalIds>,
-    pub keywords: Option<KeywordResults>,
+    pub keywords: Option<TvKeywords>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct SeasonSummary {
-    pub id: u64,
     pub name: Option<String>,
-    pub overview: Option<String>,
     pub season_number: u32,
-    pub episode_count: Option<u32>,
-    pub air_date: Option<String>,
     pub poster_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CreatedBy {
-    pub id: u64,
-    pub name: String,
-    pub profile_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct ContentRatings {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub results: Vec<ContentRating>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct ContentRating {
     pub iso_3166_1: String,
     pub rating: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct ExternalIds {
     pub imdb_id: Option<String>,
     pub tvdb_id: Option<u64>,
 }
 
-// Keywords
-#[derive(Debug, Deserialize, Serialize)]
-pub struct KeywordResults {
-    #[serde(default)]
-    pub results: Vec<Keyword>,
+#[derive(Debug, Deserialize)]
+pub struct TvKeywords {
+    #[serde(default, deserialize_with = "nullable")]
+    pub results: Vec<Named>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct MovieKeywordResults {
-    #[serde(default)]
-    pub keywords: Vec<Keyword>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Keyword {
-    pub id: u64,
-    pub name: String,
-}
-
-// Season detail
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct SeasonDetail {
-    pub id: u64,
-    pub name: Option<String>,
-    pub overview: Option<String>,
-    pub season_number: u32,
-    pub air_date: Option<String>,
     pub poster_path: Option<String>,
-    #[serde(default)]
-    pub episodes: Vec<EpisodeSummary>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub episodes: Vec<Episode>,
     pub images: Option<ImageResults>,
-    pub credits: Option<Credits>,
-    pub videos: Option<VideoResults>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct EpisodeSummary {
+#[derive(Debug, Deserialize)]
+pub struct Episode {
     pub id: u64,
     pub name: Option<String>,
     pub overview: Option<String>,
@@ -336,6 +252,34 @@ pub struct EpisodeSummary {
     pub vote_average: Option<f64>,
     pub vote_count: Option<u64>,
     pub runtime: Option<u32>,
-    pub crew: Option<Vec<CrewMember>>,
-    pub guest_stars: Option<Vec<CastMember>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub crew: Vec<CrewMember>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub guest_stars: Vec<CastMember>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_collections_deserialize_as_empty() {
+        let ep: Episode = serde_json::from_str(
+            r#"{"id":1,"episode_number":2,"season_number":1,"crew":null,"guest_stars":null}"#,
+        )
+        .unwrap();
+        assert!(ep.crew.is_empty());
+        assert!(ep.guest_stars.is_empty());
+    }
+
+    #[test]
+    fn tv_search_fields_alias_onto_movie_fields() {
+        let r: SearchResult = serde_json::from_str(
+            r#"{"id":1,"name":"Show","original_name":"Orig","first_air_date":"2020-01-01"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.title.as_deref(), Some("Show"));
+        assert_eq!(r.original_title.as_deref(), Some("Orig"));
+        assert_eq!(r.release_date.as_deref(), Some("2020-01-01"));
+    }
 }
